@@ -28,7 +28,7 @@ REGEX_OP = {
 
 ColumnTuple = namedtuple(
     'ColumnDT',
-    ['column_name', 'mData', 'search_like', 'filter', 'searchable',
+    ['column_name', 'mData', 'search_type', 'filter', 'searchable',
         'filterarg', 'nulls_order'])
 
 
@@ -52,21 +52,21 @@ def clean_regex(regex):
     :rtype: str with regex to use with database
     '''
     # copy for return
-    ret_regex = regex
+    ret_regex = str(regex)
 
     # these characters are escaped (all except alternation | and escape \)
     # see http://www.regular-expressions.info/refquick.html
     escape_chars = '[^$.?*+(){}'
 
     # remove any escape chars
-    ret_regex = ret_regex.replace('\\','')
+    ret_regex = ret_regex.replace('\\', '')
 
     # escape any characters which are used by regex
     # could probably concoct something incomprehensible using re.sub() but 
     # prefer to write clear code with this loop
     # note expectation that no characters have already been escaped
     for c in escape_chars:
-        ret_regex = ret_regex.replace(c,'\\'+c)
+        ret_regex = ret_regex.replace(c, '\\' + c)
 
     # remove any double alternations until these don't exist any more
     while True:
@@ -99,9 +99,8 @@ class ColumnDT(ColumnTuple):
     :param mData: name of the mData property as defined in the
         DataTables javascript options (default None)
     :type mData: str
-    :param search_like: is the search made in the middle of the column value.
-        If not, the column value must equals to the search value (default True)
-    :type search_like: bool
+    :param search_type: type of comparison for search (>, >=, <, <=, ==, like) 
+    :type search_type: str
     :param filter: the method needed to be executed on the cell
         values of the column
     as an equivalent of a jinja2 filter (default None)
@@ -118,7 +117,7 @@ class ColumnDT(ColumnTuple):
     :returns: a ColumnDT object
     """
 
-    def __new__(cls, column_name, mData=None, search_like=True,
+    def __new__(cls, column_name, mData=None, search_type="like",
                 filter=str, searchable=True, filterarg='cell',
                 nulls_order=None):
         """Set default values for mData and filter.
@@ -132,7 +131,7 @@ class ColumnDT(ColumnTuple):
                              % nulls_order)
 
         return super(ColumnDT, cls).__new__(
-            cls, column_name, mData, search_like, filter, searchable,
+            cls, column_name, mData, search_type, filter, searchable,
             filterarg, nulls_order)
 
 
@@ -210,7 +209,7 @@ class DataTables:
         output[totalRecords] = str(self.cardinality)
         output[totalDisplayRecords] = str(self.cardinality_filtered)
 
-        output[data] = self.results
+        output[data] = self.format_list()
 
         return output
 
@@ -229,35 +228,75 @@ class DataTables:
         self.paging()
 
         # fetch the result of the queries
-        self.results = self.query.all()
+        self.results = self.query
+        
+    def filter_row(self, result):
+        row = dict()
+        for j in range(len(self.columns)):
+            col = self.columns[j]
+            if col.filter:
+                if col.filterarg == 'cell':
+                    tmp_row = get_attr(result, col.column_name)
+                    if sys.version_info < (3, 0) \
+                            and hasattr(tmp_row, 'encode'):
+                        tmp_row = tmp_row.encode('utf-8')
+                    tmp_row = col.filter(tmp_row)
+                elif col.filterarg == 'row':
+                    tmp_row = col.filter(result)
+                else:
+                    raise InvalidParameter(
+                        "invalid filterarg %s for \ column_name %s: \
+                            filterarg must be 'row' or 'cell'"
+                        % col.filterarg, col.column_name)
+            else:
+                tmp_row = get_attr(result, col.column_name)
+            row[col.mData if col.mData else str(j)] = tmp_row
+        return row
 
+    def format_list(self):
         # return formatted results with correct filters applied
         formatted_results = []
-        for i in range(len(self.results)):
-            row = dict()
-            for j in range(len(self.columns)):
-                col = self.columns[j]
-                if col.filter:
-                    if col.filterarg == 'cell':
-                        tmp_row = get_attr(self.results[i], col.column_name)
-                        if sys.version_info < (3, 0) \
-                                and hasattr(tmp_row, 'encode'):
-                            tmp_row = tmp_row.encode('utf-8')
-                        tmp_row = col.filter(tmp_row)
-                    elif col.filterarg == 'row':
-                        tmp_row = col.filter(self.results[i])
-                    else:
-                        raise InvalidParameter(
-                            "invalid filterarg %s for \ column_name %s: \
-                                filterarg must be 'row' or 'cell'"
-                            % col.filterarg, col.column_name)
-                else:
-                    tmp_row = get_attr(self.results[i], col.column_name)
-                row[col.mData if col.mData else str(j)] = tmp_row
+        for i, result in enumerate(self.results):
+            row = self.filter_row(result)
             formatted_results.append(row)
-
-        self.results = formatted_results
-
+        return formatted_results
+        
+    def format_generator(self):
+        if self.legacy:
+            echo = 'sEcho'
+            totalRecords = 'iTotalRecords'
+            totalDisplayRecords = 'iTotalDisplayRecords'
+            data = 'aaData'
+        else:
+            echo = 'draw'
+            totalRecords = 'recordsTotal'
+            totalDisplayRecords = 'recordsFiltered'
+            data = 'data'
+            
+        if self.cardinality_filtered == 0:
+            output = '{'
+            output += '"' + echo + '": "' + str(int(self.request_values[echo])) + '", '
+            output += '"' + totalRecords + '": "' + str(self.cardinality) + '", '
+            output += '"' + totalDisplayRecords + '": "' + str(self.cardinality_filtered) + '", '
+            output += '"data": []}'
+            yield output
+        else:
+            for i, result in enumerate(self.results):
+                output = ""
+                if i == 0:
+                    output += '{'
+                    output += '"' + echo + '": "' + str(int(self.request_values[echo])) + '", '
+                    output += '"' + totalRecords + '": "' + str(self.cardinality) + '", '
+                    output += '"' + totalDisplayRecords + '": "' + str(self.cardinality_filtered) + '", '
+                    output += '"data": ['
+                row = self.filter_row(result)
+                output += str(json.dumps(row))
+                last = min(self.cardinality_filtered, self.request_values[displayLength])
+                if i != last - 1:
+                    output += ", "
+                yield output
+            yield ']}'
+        
     def filtering(self):
         """Construct the query: filtering.
 
@@ -283,33 +322,41 @@ class DataTables:
         def search(idx, col):
             # FIXME: @hybrid properties that reference json or similar columns
             tmp_column_name = col.column_name.split('.')
+            is_label = False
             for tmp_name in tmp_column_name:
-                # This handles the x.y.z.a option
-                if tmp_column_name.index(tmp_name) == 0:
+                try:
                     obj = getattr(self.sqla_object, tmp_name)
-                    parent = self.sqla_object
-                elif isinstance(obj.property, RelationshipProperty):
-                    # otherwise try and see if we can percolate down the list
-                    # for relationships of relationships.
-                    parent = obj.property.mapper.class_
-                    obj = getattr(parent, tmp_name)
-
-                # Ex: hybrid_property or property
-                if not hasattr(obj, 'property'):
-                    sqla_obj = parent
+                except AttributeError:
                     column_name = tmp_name
-                # Ex: ForeignKey
-                elif isinstance(obj.property, RelationshipProperty):
-                    # Ex: address.description
-                    sqla_obj = obj.mapper.class_
-                    column_name = tmp_name
-                    if not column_name:
-                        # find first primary key
-                        column_name = obj.property.table.primary_key.columns \
-                            .values()[0].name
-                else:
-                    sqla_obj = parent
-                    column_name = tmp_name
+                    is_label = True
+                    sqla_obj = self.sqla_object
+                if not is_label:
+                    # This handles the x.y.z.a option
+                    if tmp_column_name.index(tmp_name) == 0:
+                        obj = getattr(self.sqla_object, tmp_name)
+                        parent = self.sqla_object
+                    elif isinstance(obj.property, RelationshipProperty):
+                        # otherwise try and see if we can percolate down the list
+                        # for relationships of relationships.
+                        parent = obj.property.mapper.class_
+                        obj = getattr(parent, tmp_name)
+    
+                    # Ex: hybrid_property or property
+                    if not hasattr(obj, 'property'):
+                        sqla_obj = parent
+                        column_name = tmp_name
+                    # Ex: ForeignKey
+                    elif isinstance(obj.property, RelationshipProperty):
+                        # Ex: address.description
+                        sqla_obj = obj.mapper.class_
+                        column_name = tmp_name
+                        if not column_name:
+                            # find first primary key
+                            column_name = obj.property.table.primary_key.columns \
+                                .values()[0].name
+                    else:
+                        sqla_obj = parent
+                        column_name = tmp_name
             return sqla_obj, column_name
 
         if searchValue:
@@ -324,7 +371,7 @@ class DataTables:
                         True, 'true') and col.searchable:
                     sqla_obj, column_name = search(idx, col)
                     # regex takes precedence
-                    if (searchRegex in ( True, 'true')
+                    if (searchRegex in (True, 'true')
                             and self.dialect in REGEX_OP
                             and len(regex) >= 1):
                         conditions.append(cast(
@@ -343,30 +390,57 @@ class DataTables:
 
             if search_value2:
                 sqla_obj, column_name = search(idx, col)
-
-                # regex takes precedence over search_like
+                
+                # regex takes precedence over search_type
                 regex = clean_regex(search_value2)
                 if (self.request_values.get(searchableColumnRegex % idx) 
-                            in ( True, 'true') and
+                            in (True, 'true') and
                             self.dialect in REGEX_OP and 
                             len(regex) >= 1):
                     conditions.append(cast(
                         get_attr(sqla_obj, column_name), String)
                         .op(REGEX_OP[self.dialect])(regex))
-                elif col.search_like:
-                    conditions.append(cast(
-                        get_attr(sqla_obj, column_name), String)
+                elif col.search_type == "like":
+                    sqla_attr = get_attr(sqla_obj, column_name)
+                    if sqla_attr == None:
+                        sqla_attr = text(str(column_name))
+                    conditions.append(cast(sqla_attr, String(1024))
                         .ilike('%%%s%%' % search_value2))
+                elif col.search_type == "<":
+                    sqla_attr = get_attr(sqla_obj, column_name)
+                    if sqla_attr == None:
+                        sqla_attr = text(str(column_name))
+                    conditions.append(cast(sqla_attr, String(1024))
+                        .__lt__(search_value2))
+                elif col.search_type == "<=":
+                    sqla_attr = get_attr(sqla_obj, column_name)
+                    if sqla_attr == None:
+                        sqla_attr = text(str(column_name))
+                    conditions.append(cast(sqla_attr, String(1024))
+                        .__le__(search_value2))
+                elif col.search_type == ">":
+                    sqla_attr = get_attr(sqla_obj, column_name)
+                    if sqla_attr == None:
+                        sqla_attr = text(str(column_name))
+                    conditions.append(cast(sqla_attr, String(1024))
+                        .__gt__(search_value2))
+                elif col.search_type == ">=":
+                    sqla_attr = get_attr(sqla_obj, column_name)
+                    if sqla_attr == None:
+                        sqla_attr = text(str(column_name))
+                    conditions.append(cast(sqla_attr, String(1024))
+                        .__ge__(search_value2))
                 else:
-                    conditions.append(cast(
-                        get_attr(sqla_obj, column_name), String)
+                    sqla_attr = get_attr(sqla_obj, column_name)
+                    if sqla_attr == None:
+                        sqla_attr = text(str(column_name))
+                    conditions.append(cast(sqla_attr, String(1024))
                         .__eq__(search_value2))
-
                 if condition is not None:
                     condition = and_(condition, and_(*conditions))
                 else:
                     condition = and_(*conditions)
-
+                print(condition)
         if condition is not None:
             self.query = self.query.filter(condition)
             # count after filtering
@@ -391,54 +465,63 @@ class DataTables:
             dirOrder = 'order[%s][dir]'
 
         i = 0
-        if self.request_values.get(columnOrder % i) is not None:
-            sorting.append(
-                Order(
-                    self.columns[
-                        int(self.request_values[columnOrder % i])].column_name,
-                    self.request_values[dirOrder % i],
-                    self.columns[
-                        int(self.request_values[columnOrder % i])]
-                    .nulls_order))
+        while i < len(self.columns):
+            if self.request_values.get(columnOrder % i) is not None:
+                sorting.append(
+                    Order(
+                        self.columns[
+                            int(self.request_values[columnOrder % i])].column_name,
+                        self.request_values[dirOrder % i],
+                        self.columns[
+                            int(self.request_values[columnOrder % i])]
+                        .nulls_order))
+            i += 1
 
         for sort in sorting:
             tmp_sort_name = sort.name.split('.')
             for tmp_name in tmp_sort_name:
-                # iterate over the list so we can support things like x.y.z.a
-                if tmp_sort_name.index(tmp_name) == 0:
+                is_label = False
+                try:
                     obj = getattr(self.sqla_object, tmp_name)
-                    parent = self.sqla_object
-                elif isinstance(obj.property, RelationshipProperty):
-                    # otherwise try and see if we can percolate down the list
-                    # for relationships of relationships.
-                    parent = obj.property.mapper.class_
-                    obj = getattr(parent, tmp_name)
-
-                if not hasattr(obj, 'property'):  # hybrid_property or property
+                except AttributeError:
                     sort_name = tmp_name
-                    if hasattr(parent, '__tablename__'):
-                        tablename = parent.__tablename__
-                    else:
-                        tablename = parent.__table__.name
-                # Ex: ForeignKey
-                elif isinstance(obj.property, RelationshipProperty):
-                    # Ex: address.description => description =>
-                    # addresses.description
-                    sort_name = tmp_name
-                    if not sort_name:
-                        # Find first primary key
-                        sort_name = obj.property.table.primary_key.columns \
-                            .values()[0].name
-                    tablename = obj.property.table.name
-                else:  # -> ColumnProperty
-                    sort_name = tmp_name
+                    is_label = True
+                if not is_label:
+                    # iterate over the list so we can support things like x.y.z.a
+                    if tmp_sort_name.index(tmp_name) == 0:
+                        obj = getattr(self.sqla_object, tmp_name)
+                        parent = self.sqla_object
+                    elif isinstance(obj.property, RelationshipProperty):
+                        # otherwise try and see if we can percolate down the list
+                        # for relationships of relationships.
+                        parent = obj.property.mapper.class_
+                        obj = getattr(parent, tmp_name)
+    
+                    if not hasattr(obj, 'property'):  # hybrid_property or property
+                        sort_name = tmp_name
+                        if hasattr(parent, '__tablename__'):
+                            tablename = parent.__tablename__
+                        else:
+                            tablename = parent.__table__.name
+                    # Ex: ForeignKey
+                    elif isinstance(obj.property, RelationshipProperty):
+                        # Ex: address.description => description =>
+                        # addresses.description
+                        sort_name = tmp_name
+                        if not sort_name:
+                            # Find first primary key
+                            sort_name = obj.property.table.primary_key.columns \
+                                .values()[0].name
+                        tablename = obj.property.table.name
+                    else:  # -> ColumnProperty
+                        sort_name = tmp_name
+    
+                        if hasattr(parent, '__tablename__'):
+                            tablename = parent.__tablename__
+                        else:
+                            tablename = parent.__table__.name
 
-                    if hasattr(parent, '__tablename__'):
-                        tablename = parent.__tablename__
-                    else:
-                        tablename = parent.__table__.name
-
-            sort_name = '%s.%s' % (tablename, sort_name)
+                    sort_name = '%s.%s' % (tablename, sort_name)
 
             ordering = asc(text(sort_name)) if sort.dir == 'asc' else desc(
                 text(sort_name))
@@ -468,5 +551,5 @@ class DataTables:
             pages.start = int(self.request_values[displayStart])
             pages.length = int(self.request_values[displayLength])
 
-        offset = pages.start + pages.length
-        self.query = self.query.slice(pages.start, offset)
+            offset = pages.start + pages.length
+            self.query = self.query.slice(pages.start, offset)
