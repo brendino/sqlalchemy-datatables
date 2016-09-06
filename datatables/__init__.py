@@ -440,7 +440,6 @@ class DataTables:
                     condition = and_(condition, and_(*conditions))
                 else:
                     condition = and_(*conditions)
-                print(condition)
         if condition is not None:
             self.query = self.query.filter(condition)
             # count after filtering
